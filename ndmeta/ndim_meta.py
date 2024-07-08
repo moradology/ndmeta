@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import functools
 from itertools import product
+import logging
 import operator
 from typing import Dict, Optional
 
@@ -10,6 +11,9 @@ import xarray as xr
 
 from .array_meta import ArrayMeta
 from . import util
+
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class NDimMeta:
@@ -50,29 +54,57 @@ class NDimMeta:
                 actual_covered_ranges = {}
 
                 for dim, slice_range in chunk_ranges.items():
-                    if dim in dataset.variables:
-                        file_size = dataset.sizes[dim]
-                        file_start = file_index * chunk_sizes[dim]
-                        file_end = file_start + file_size
+                    if dim in dataset.variables and dim == self.concat_dim:
+                        chunk_size = chunk_sizes[dim]
 
-                        if slice_range.start >= file_start and slice_range.stop <= file_end:
-                            actual_covered_ranges[dim] = slice(slice_range.start - file_start, slice_range.stop - file_start)
-                        elif slice_range.start <= file_end and slice_range.stop >= file_start:
-                            start_index = max(file_start, slice_range.start) - file_start
-                            stop_index = min(slice_range.stop, file_end) - file_start
-                            actual_covered_ranges[dim] = slice(start_index, stop_index)
-                            fully_covered = False
-                        else:
+                        # Calculate the start and end indices of the current file
+                        file_start = file_index * dataset.sizes[dim]
+                        file_end = file_start + dataset.sizes[dim]
+
+                        chunk_start = slice_range.start
+                        chunk_end = slice_range.stop
+
+                        # Calculate the end index of the first chunk within the current file
+                        file_chunk_offset = file_start % chunk_size
+
+                        # Not covered at all, move on
+                        if chunk_end < file_start or chunk_start > file_end:
                             fully_covered = False
                             partially_covered = False
                             break
+
+                        # Check if the chunk starts before the current file
+                        if chunk_start < file_start:
+                            fully_covered = False
+                            if chunk_end <= file_end:
+                                # The chunk ends within the current file
+                                actual_covered_ranges[dim] = slice(0, chunk_size - file_chunk_offset)
+                            else:
+                                # The chunk ends beyond the current file
+                                actual_covered_ranges[dim] = slice(0, dataset.sizes[dim])
+                        # Check if the chunk starts within the current file
+                        elif chunk_start < file_end:
+                            if chunk_end <= file_end:
+                                # The chunk is fully contained within the current file
+                                actual_covered_ranges[dim] = slice(chunk_start - file_start, chunk_end - file_start)
+                            else:
+                                # The chunk extends beyond the current file
+                                actual_covered_ranges[dim] = slice(chunk_start - file_chunk_offset, dataset.sizes[dim])
+                                fully_covered = False
                     else:
                         actual_covered_ranges[dim] = slice_range
 
                 if fully_covered:
-                    covered_results['full_coverage'].append((var_name, chunk_ranges))
+                    logger.info(f"FULLY COVERED: {var_name=}, {actual_covered_ranges=}")
+                    logger.info("---")
+                    covered_results['full_coverage'].append((var_name, actual_covered_ranges))
                 elif partially_covered and actual_covered_ranges:
+                    logger.info(f"PARTIALLY COVERED: {var_name=}, {actual_covered_ranges=}")
+                    logger.info("---")
                     covered_results['partial_coverage'].append((var_name, actual_covered_ranges))
+                else:
+                    logger.info(f"NOT COVERED: {var_name=}, {chunk_ranges=}")
+                    logger.info("---")
 
         return covered_results
 
@@ -121,7 +153,7 @@ class NDimMeta:
                 last_value = dimension_data.isel({dim: -1}).values.item()
                 dimension_ranges[dim] = (first_value, last_value)
                 if dim not in visited_dims:
-                    print(f"Dimension {dim} ranges from {first_value} to {last_value}")
+                    logger.info(f"Dimension {dim} ranges from {first_value} to {last_value}")
                     visited_dims.add(dim)
 
 
@@ -167,20 +199,20 @@ class NDimMeta:
         return {dim: meta for dim, meta in self.array_meta.items() if meta.is_data_var}
 
     def analyze_chunking_strategy(self, chunk_sizes):
-        print("Starting chunking strategy analysis for each proposed dimension:")
+        logger.info("Starting chunking strategy analysis for each proposed dimension:")
         proposed_chunk_mem = {}
         for dim, chunk_size in chunk_sizes.items():
-            print(f"\n=== Dimension: {dim} ===")
+            logger.info(f"\n=== Dimension: {dim} ===")
             dim_size = self.array_meta[dim].shape[0]
             estimated_object_size = self.array_meta[dim].estimated_obj_size
             proposed_chunk_mem[dim] = util.analyze_chunking_strategy(dim_size, chunk_size, estimated_object_size)
 
         chunk_sizes['bnds'] = 2
-        print("With the proposed chunking strategy, data variable chunks will have roughly the following sizes:")
+        logger.info("With the proposed chunking strategy, data variable chunks will have roughly the following sizes:")
         for var_name, meta in self.data_vars.items():
             data_var_indices = meta.attributes['dimension_names']
             data_var_chunk_shape = [chunk_sizes[dim] for dim in data_var_indices]
             data_var_chunk_mem = meta.estimated_obj_size * functools.reduce(operator.mul, data_var_chunk_shape)
             formatted_mem = util.format_mem_size(data_var_chunk_mem)
-            print(f"Data Variable {var_name}")
-            print(f"  - Chunk shape {tuple(data_var_chunk_shape)} @{formatted_mem} per chunk.")
+            logger.info(f"Data Variable {var_name}")
+            logger.info(f"  - Chunk shape {tuple(data_var_chunk_shape)} @{formatted_mem} per chunk.")
